@@ -1,0 +1,30 @@
+{
+  "name": "@eliotmatrva/access",
+  "version": "0.1.0",
+  "description": "User access: provision people, sign them in, ask if they may do a thing.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./express": "./src/express.js",
+    "./memory": "./src/memory.js",
+    "./pg": "./src/pg.js"
+  },
+  "files": ["src", "sql"],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "express": "^5.0.0",
+    "pg": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "express": { "optional": true },
+    "pg": { "optional": true }
+  }
+}
