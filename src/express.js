@@ -1,122 +1,180 @@
-import express from "express";
-import { AccessError, codes } from "./errors.js";
+import { AccessError, isAccessError } from "./errors.js";
+import { cookieFromReq, sessionSetCookie, sessionClearCookie } from "./session.js";
 
 function sendError(res, err) {
-  const status = err instanceof AccessError ? err.status : 500;
-  const code = err instanceof AccessError ? err.code : "ERROR";
-  const message = err instanceof AccessError ? err.message : "Server error";
-  res.status(status).json({ error: message, code });
+  if (isAccessError(err)) {
+    return res.status(err.status || 400).json({ error: err.message, code: err.code });
+  }
+  console.error(err);
+  return res.status(500).json({ error: "Internal server error", code: "INTERNAL" });
 }
 
+/**
+ * @param {ReturnType<import("./access.js").createAccess>} access
+ * @param {{ cookie?: { path?: string, sameSite?: string, secure?: boolean } }} [opts]
+ */
 export function createAccessRouter(access, opts = {}) {
-  const router = express.Router();
-  const adminPermission = opts.adminPermission || "admin";
-  const hasAdmin = access.permissions.includes(adminPermission);
+  const cookieOpts = {
+    path: opts.cookie?.path || "/",
+    sameSite: opts.cookie?.sameSite || "Lax",
+    secure: opts.cookie?.secure ?? false,
+    maxAgeSec: access.sessionTtlSec,
+  };
+  const name = access.cookieName;
 
-  router.post("/login", async (req, res) => {
-    try {
-      const user = await access.authenticate(req.body?.email, req.body?.password);
-      const full = await access.store.getUser(user.id);
-      access.setCookieHeader(res, access.issueToken(user, full));
-      res.json({ ok: true, user });
-    } catch (err) {
-      sendError(res, err);
+  function tokenFromReq(req) {
+    const header = req.headers?.authorization;
+    if (header && String(header).startsWith("Bearer ")) {
+      return String(header).slice(7).trim();
     }
-  });
-
-  router.post("/logout", (_req, res) => {
-    access.clearCookieHeader(res);
-    res.json({ ok: true });
-  });
-
-  router.get("/me", access.requireAuth(), (req, res) => {
-    res.json({ user: req.accessUser });
-  });
-
-  router.post("/change-password", access.requireAuth(), async (req, res) => {
-    try {
-      const user = await access.changePassword(
-        req.accessUser.id,
-        req.body?.currentPassword,
-        req.body?.newPassword,
-      );
-      const full = await access.store.getUser(user.id);
-      access.setCookieHeader(res, access.issueToken(user, full));
-      res.json({ ok: true, user });
-    } catch (err) {
-      sendError(res, err);
-    }
-  });
-
-  if (hasAdmin) {
-    router.get("/users", access.require(adminPermission), async (_req, res) => {
-      try {
-        res.json({ users: await access.users.list() });
-      } catch (err) {
-        sendError(res, err);
-      }
-    });
-
-    router.post("/users", access.require(adminPermission), async (req, res) => {
-      try {
-        const user = await access.users.create({
-          name: req.body?.name,
-          email: req.body?.email,
-          permissions: req.body?.permissions || [],
-          password: req.body?.password,
-        });
-        res.status(201).json({ user });
-      } catch (err) {
-        sendError(res, err);
-      }
-    });
-
-    router.post("/users/:id/disable", access.require(adminPermission), async (req, res) => {
-      try {
-        const user = await access.users.disable(req.params.id);
-        res.json({ user });
-      } catch (err) {
-        sendError(res, err);
-      }
-    });
-
-    router.post("/users/:id/permissions", access.require(adminPermission), async (req, res) => {
-      try {
-        const user = await access.users.setPermissions(req.params.id, req.body?.permissions || []);
-        res.json({ user });
-      } catch (err) {
-        sendError(res, err);
-      }
-    });
-
-    router.post("/invites", access.require(adminPermission), async (req, res) => {
-      try {
-        const invite = await access.invites.create({
-          email: req.body?.email,
-          permissions: req.body?.permissions || [],
-          ttlSec: req.body?.ttlSec,
-          createdBy: req.accessUser.id,
-        });
-        res.status(201).json({ invite });
-      } catch (err) {
-        sendError(res, err);
-      }
-    });
+    return cookieFromReq(req, name);
   }
 
-  router.post("/invites/consume", async (req, res) => {
+  async function authenticate(req, res, next) {
     try {
-      const user = await access.invites.consume(req.body?.token, {
-        name: req.body?.name,
-        password: req.body?.password,
-      });
-      const full = await access.store.getUser(user.id);
-      access.setCookieHeader(res, access.issueToken(user, full));
-      res.json({ ok: true, user });
+      const token = tokenFromReq(req);
+      if (!token) {
+        req.user = null;
+        return next();
+      }
+      req.user = await access.userFromToken(token);
+      req.accessToken = token;
+      return next();
     } catch (err) {
-      sendError(res, err);
+      if (isAccessError(err) && (err.code === "UNAUTHENTICATED" || err.code === "EXPIRED" || err.code === "DISABLED")) {
+        req.user = null;
+        return next();
+      }
+      return sendError(res, err);
     }
-  });
+  }
 
-  return router;
+  function requireAuth(req, res, next) {
+    if (!req.user) {
+      return res.status(401).json({ error: "Not authenticated", code: "UNAUTHENTICATED" });
+    }
+    return next();
+  }
+
+  function require(permission) {
+    return (req, res, next) => {
+      if (!req.user) {
+        return res.status(401).json({ error: "Not authenticated", code: "UNAUTHENTICATED" });
+      }
+      if (!access.can(req.user, permission)) {
+        return res.status(403).json({ error: `Missing permission: ${permission}`, code: "FORBIDDEN" });
+      }
+      return next();
+    };
+  }
+
+  function router(express) {
+    const r = express.Router();
+    r.use(authenticate);
+
+    r.post("/login", async (req, res) => {
+      try {
+        const email = req.body?.email;
+        const password = req.body?.password;
+        const result = await access.login(email, password);
+        res.setHeader(
+          "Set-Cookie",
+          sessionSetCookie(name, result.token, {
+            ...cookieOpts,
+            maxAgeSec: result.sessionTtlSec,
+          }),
+        );
+        return res.json({ user: result.user });
+      } catch (err) {
+        return sendError(res, err);
+      }
+    });
+
+    r.post("/logout", async (req, res) => {
+      try {
+        const token = tokenFromReq(req);
+        if (token) await access.logout(token);
+        res.setHeader("Set-Cookie", sessionClearCookie(name, cookieOpts));
+        return res.json({ ok: true });
+      } catch (err) {
+        return sendError(res, err);
+      }
+    });
+
+    r.get("/me", requireAuth, (req, res) => {
+      return res.json({ user: req.user });
+    });
+
+    r.post("/change-password", requireAuth, async (req, res) => {
+      try {
+        const currentPassword = req.body?.currentPassword ?? req.body?.current;
+        const newPassword = req.body?.newPassword ?? req.body?.password;
+        await access.changePassword(req.user.id, currentPassword, newPassword);
+        return res.json({ ok: true });
+      } catch (err) {
+        return sendError(res, err);
+      }
+    });
+
+    r.get("/users", require("admin"), async (req, res) => {
+      try {
+        const users = await access.listUsers(req.user);
+        return res.json({ users });
+      } catch (err) {
+        return sendError(res, err);
+      }
+    });
+
+    r.post("/users", require("admin"), async (req, res) => {
+      try {
+        const user = await access.createUser(req.user, {
+          name: req.body?.name,
+          email: req.body?.email,
+          permissions: req.body?.permissions,
+          password: req.body?.password,
+        });
+        return res.status(201).json({ user });
+      } catch (err) {
+        return sendError(res, err);
+      }
+    });
+
+    r.post("/invites", require("admin"), async (req, res) => {
+      try {
+        const result = await access.createInvite(req.user, {
+          email: req.body?.email,
+          permissions: req.body?.permissions,
+        });
+        return res.status(201).json(result);
+      } catch (err) {
+        return sendError(res, err);
+      }
+    });
+
+    r.post("/invites/accept", async (req, res) => {
+      try {
+        const user = await access.acceptInvite(req.body?.token, {
+          name: req.body?.name,
+          password: req.body?.password,
+        });
+        return res.status(201).json({ user });
+      } catch (err) {
+        return sendError(res, err);
+      }
+    });
+
+    return r;
+  }
+
+  return {
+    router,
+    authenticate,
+    requireAuth,
+    require,
+  };
+}
+
+/** @deprecated Use createAccessRouter */
+export function attachAccess(access, opts) {
+  return createAccessRouter(access, opts);
 }

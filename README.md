@@ -33,6 +33,8 @@ const access = createAccess({
   permissions: ["admin", "edit", "view"],
 });
 
+await access.ready();
+
 await access.bootstrapAdmin({
   name: "Ada",
   email: "ada@example.com",
@@ -41,7 +43,7 @@ await access.bootstrapAdmin({
 });
 
 const { user, token } = await access.login("ada@example.com", "password1");
-const me = await access.userFromToken(token);
+const me = await access.authenticate(token);
 access.can(me, "admin"); // true
 ```
 
@@ -50,14 +52,14 @@ access.can(me, "admin"); // true
 ```js
 import express from "express";
 import { createAccess, MemoryStore } from "@eliotmatrva/access";
-import { attachAccess } from "@eliotmatrva/access/express";
+import { createAccessRouter } from "@eliotmatrva/access/express";
 
 const access = createAccess({
   store: new MemoryStore(),
   secret: process.env.ACCESS_SECRET,
   permissions: ["admin", "edit", "view"],
 });
-const wired = attachAccess(access);
+const wired = createAccessRouter(access);
 
 const app = express();
 app.use(express.json());
@@ -66,7 +68,7 @@ app.get("/secret", wired.requireAuth, (req, res) => res.json({ user: req.user })
 app.post("/publish", wired.require("edit"), (req, res) => res.json({ ok: true }));
 ```
 
-Routes mounted by the router: `POST /login`, `POST /logout`, `GET /me`, `POST /change-password`, `GET /users`, `POST /users`.
+Routes mounted by the router: `POST /login`, `POST /logout`, `GET /me`, `POST /change-password`, `GET /users`, `POST /users`, `POST /invites`, `POST /invites/accept`.
 
 ### Postgres
 
@@ -76,10 +78,30 @@ import { PostgresStore } from "@eliotmatrva/access/pg";
 
 const store = new PostgresStore(pool);
 await store.migrate();
-const access = createAccess({ store, secret: process.env.ACCESS_SECRET });
+const access = createAccess({
+  store,
+  secret: process.env.ACCESS_SECRET,
+  permissions: ["admin", "edit", "view"],
+});
+await access.ready();
 ```
 
-Tables: `access_user`, `access_credential`, `access_invite`. Schema lives in `sql/schema.sql`.
+Tables: `access_user`, `access_credential`, `access_session`, `access_invite`. Schema lives in `sql/schema.sql`.
+
+## API surface
+
+- `createAccess({ store, secret, permissions, sessionTtlSec?, inviteTtlSec?, cookieName? })`
+- `access.ready()`
+- `access.bootstrapAdmin({ name, email, password, permissions })`
+- `access.login(email, password)` → `{ user, token, ... }`
+- `access.logout(token)`
+- `access.authenticate(token)` / `access.userFromToken(token)`
+- `access.require(permission)` → async (token) => user
+- `access.can(user, permission)`
+- `access.changePassword(userId, current, next)`
+- Admin: `listUsers`, `createUser`, `updateUser`, `disableUser`, `createInvite`, `acceptInvite`
+- Stores: `MemoryStore`, `PostgresStore` (with `migrate()`)
+- Express: `createAccessRouter(access)` → `{ router, authenticate, requireAuth, require }`
 
 ## What this is not
 
